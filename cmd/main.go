@@ -237,121 +237,90 @@ func removeLambdaImport(file *ast.File) {
 	}
 }
 
+// importInfo holds information about a required import
+type importInfo struct {
+	path      string
+	alias     string
+	hasImport bool
+	needed    bool
+}
+
+// checkImport checks if an import exists and captures its alias
+func checkImport(importSpec *ast.ImportSpec, info *importInfo) {
+	importPath := strings.Trim(importSpec.Path.Value, `"`)
+	if importPath == info.path {
+		info.hasImport = true
+		if importSpec.Name != nil {
+			info.alias = importSpec.Name.Name
+		}
+	}
+}
+
+// createImportSpec creates an import spec from the import info
+func createImportSpec(path string) *ast.ImportSpec {
+	return &ast.ImportSpec{
+		Path: &ast.BasicLit{Kind: token.STRING, Value: `"` + path + `"`},
+	}
+}
+
 // addRequiredImports adds required imports based on handler signature
 // Returns the package names/aliases to use for context, http, and io
 func addRequiredImports(file *ast.File, handlerSig *HandlerSignature) (contextAlias, httpAlias, ioAlias string) {
-	// Check existing imports and get their aliases
-	contextAlias = "context"
-	httpAlias = "http"
-	ioAlias = "io"
-	hasContext := false
-	hasNetHTTP := false
-	hasIO := false
-	hasJSON := false
-	hasLog := false
+	// Define required imports
+	imports := map[string]*importInfo{
+		"context":       {path: "context", alias: "context", needed: true},
+		"net/http":      {path: "net/http", alias: "http", needed: true},
+		"io":            {path: "io", alias: "io", needed: handlerSig.HasInput},
+		"encoding/json": {path: "encoding/json", alias: "json", needed: handlerSig.HasOutput},
+		"log":           {path: "log", alias: "log", needed: handlerSig.HasError},
+	}
 
+	// Check existing imports and capture aliases
 	for _, decl := range file.Decls {
 		if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.IMPORT {
 			for _, spec := range genDecl.Specs {
 				if importSpec, ok := spec.(*ast.ImportSpec); ok {
-					importPath := strings.Trim(importSpec.Path.Value, `"`)
-					if importPath == "context" {
-						hasContext = true
-						if importSpec.Name != nil {
-							contextAlias = importSpec.Name.Name
-						}
-					}
-					if importPath == "net/http" {
-						hasNetHTTP = true
-						if importSpec.Name != nil {
-							httpAlias = importSpec.Name.Name
-						}
-					}
-					if importPath == "io" {
-						hasIO = true
-						if importSpec.Name != nil {
-							ioAlias = importSpec.Name.Name
-						}
-					}
-					if importPath == "encoding/json" {
-						hasJSON = true
-					}
-					if importPath == "log" {
-						hasLog = true
+					for _, info := range imports {
+						checkImport(importSpec, info)
 					}
 				}
 			}
 		}
 	}
 
-	// Determine what imports we need
-	needIO := handlerSig.HasInput
-	needJSON := handlerSig.HasOutput
-	needLog := handlerSig.HasError
+	// Collect missing imports that are needed
+	var missingImports []string
+	for _, info := range imports {
+		if info.needed && !info.hasImport {
+			missingImports = append(missingImports, info.path)
+		}
+	}
 
 	// Add missing imports
-	if !hasContext || !hasNetHTTP || (needIO && !hasIO) || (needJSON && !hasJSON) || (needLog && !hasLog) {
+	if len(missingImports) > 0 {
+		// Try to add to existing import declaration
 		for i, decl := range file.Decls {
 			if genDecl, ok := decl.(*ast.GenDecl); ok && genDecl.Tok == token.IMPORT {
-				if !hasContext {
-					genDecl.Specs = append(genDecl.Specs, &ast.ImportSpec{
-						Path: &ast.BasicLit{Kind: token.STRING, Value: `"context"`},
-					})
-				}
-				if needJSON && !hasJSON {
-					genDecl.Specs = append(genDecl.Specs, &ast.ImportSpec{
-						Path: &ast.BasicLit{Kind: token.STRING, Value: `"encoding/json"`},
-					})
-				}
-				if needIO && !hasIO {
-					genDecl.Specs = append(genDecl.Specs, &ast.ImportSpec{
-						Path: &ast.BasicLit{Kind: token.STRING, Value: `"io"`},
-					})
-				}
-				if needLog && !hasLog {
-					genDecl.Specs = append(genDecl.Specs, &ast.ImportSpec{
-						Path: &ast.BasicLit{Kind: token.STRING, Value: `"log"`},
-					})
-				}
-				if !hasNetHTTP {
-					genDecl.Specs = append(genDecl.Specs, &ast.ImportSpec{
-						Path: &ast.BasicLit{Kind: token.STRING, Value: `"net/http"`},
-					})
+				for _, path := range missingImports {
+					genDecl.Specs = append(genDecl.Specs, createImportSpec(path))
 				}
 				file.Decls[i] = genDecl
-				return contextAlias, httpAlias, ioAlias
+				return imports["context"].alias, imports["net/http"].alias, imports["io"].alias
 			}
 		}
 
-		// If no import declaration exists, create one
+		// If no import declaration exists, create one with all needed imports
 		var specs []ast.Spec
-		specs = append(specs, &ast.ImportSpec{
-			Path: &ast.BasicLit{Kind: token.STRING, Value: `"context"`},
-		})
-		if needJSON {
-			specs = append(specs, &ast.ImportSpec{
-				Path: &ast.BasicLit{Kind: token.STRING, Value: `"encoding/json"`},
-			})
+		for _, info := range imports {
+			if info.needed {
+				specs = append(specs, createImportSpec(info.path))
+			}
 		}
-		if needIO {
-			specs = append(specs, &ast.ImportSpec{
-				Path: &ast.BasicLit{Kind: token.STRING, Value: `"io"`},
-			})
-		}
-		if needLog {
-			specs = append(specs, &ast.ImportSpec{
-				Path: &ast.BasicLit{Kind: token.STRING, Value: `"log"`},
-			})
-		}
-		specs = append(specs, &ast.ImportSpec{
-			Path: &ast.BasicLit{Kind: token.STRING, Value: `"net/http"`},
-		})
-
 		newImport := &ast.GenDecl{Tok: token.IMPORT, Specs: specs}
 		file.Decls = append([]ast.Decl{newImport}, file.Decls...)
 	}
 
-	return contextAlias, httpAlias, ioAlias
+	return imports["context"].alias, imports["net/http"].alias, imports["io"].alias
 }
 
 // createHandlerStruct creates the Handler struct declaration
