@@ -1,4 +1,4 @@
-module knative.dev/func-lambda-migrator
+module github.com/creydr/knative-lambda-func-migrator-poc
 
 go 1.25.3
 
