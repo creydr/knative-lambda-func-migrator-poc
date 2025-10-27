@@ -7,9 +7,13 @@ import (
 	"go/parser"
 	"go/printer"
 	"go/token"
+	"go/types"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
+
+	"golang.org/x/tools/go/packages"
 )
 
 func main() {
@@ -35,22 +39,28 @@ func main() {
 		log.Fatalf("Failed to parse Go file: %v", err)
 	}
 
-	// Find the lambda.Start call and extract handler function name
-	handlerFuncName, err := findLambdaHandler(file)
+	// Find the lambda.Start call and extract handler reference
+	handlerRef, err := findLambdaHandler(file)
 	if err != nil {
 		log.Fatalf("Failed to find lambda handler: %v", err)
 	}
 
-	fmt.Fprintf(os.Stderr, "Found Lambda handler: %s\n", handlerFuncName)
+	fmt.Fprintf(os.Stderr, "Found Lambda handler: %s\n", handlerRef.QualifiedName)
 
 	// Analyze the handler function signature
-	handlerSig, err := analyzeHandlerSignature(file, handlerFuncName)
+	// First try AST-based analysis (works for handlers in the same file)
+	handlerSig, err := analyzeHandlerSignature(file, handlerRef.SimpleName)
 	if err != nil {
-		log.Fatalf("Failed to analyze handler signature: %v", err)
+		// If not found in AST, try type-based analysis (works for imported handlers)
+		fmt.Fprintf(os.Stderr, "Handler not found in file, trying type checker...\n")
+		handlerSig, err = analyzeHandlerSignatureWithTypes(*inputFile, file, handlerRef.SimpleName, fset)
+		if err != nil {
+			log.Fatalf("Failed to analyze handler signature: %v", err)
+		}
 	}
 
 	// Transform the AST
-	transformAST(file, handlerFuncName, handlerSig)
+	transformAST(file, handlerRef.QualifiedName, handlerSig)
 
 	// Write the output
 	var output *os.File
@@ -139,9 +149,15 @@ func analyzeHandlerSignature(file *ast.File, handlerName string) (*HandlerSignat
 	return sig, nil
 }
 
-// findLambdaHandler searches for lambda.Start() call and returns the handler function name
-func findLambdaHandler(file *ast.File) (string, error) {
-	var handlerName string
+// HandlerReference holds information about the lambda handler reference
+type HandlerReference struct {
+	SimpleName    string // Just the function name (e.g., "HandleRequest")
+	QualifiedName string // Full name including package if present (e.g., "handler.HandleRequest")
+}
+
+// findLambdaHandler searches for lambda.Start() call and returns the handler reference
+func findLambdaHandler(file *ast.File) (*HandlerReference, error) {
+	var handlerRef *HandlerReference
 	var foundMain bool
 
 	ast.Inspect(file, func(n ast.Node) bool {
@@ -157,9 +173,23 @@ func findLambdaHandler(file *ast.File) (string, error) {
 							if ident.Name == "lambda" && selExpr.Sel.Name == "Start" {
 								// Extract the handler function name
 								if len(callExpr.Args) > 0 {
+									// Check if it's a simple identifier (e.g., handleRequest)
 									if handlerIdent, ok := callExpr.Args[0].(*ast.Ident); ok {
-										handlerName = handlerIdent.Name
+										handlerRef = &HandlerReference{
+											SimpleName:    handlerIdent.Name,
+											QualifiedName: handlerIdent.Name,
+										}
 										return false
+									}
+									// Check if it's a selector (e.g., handler.HandleRequest)
+									if handlerSel, ok := callExpr.Args[0].(*ast.SelectorExpr); ok {
+										if pkgIdent, ok := handlerSel.X.(*ast.Ident); ok {
+											handlerRef = &HandlerReference{
+												SimpleName:    handlerSel.Sel.Name,
+												QualifiedName: pkgIdent.Name + "." + handlerSel.Sel.Name,
+											}
+											return false
+										}
 									}
 								}
 							}
@@ -173,14 +203,14 @@ func findLambdaHandler(file *ast.File) (string, error) {
 	})
 
 	if !foundMain {
-		return "", fmt.Errorf("main function not found")
+		return nil, fmt.Errorf("main function not found")
 	}
 
-	if handlerName == "" {
-		return "", fmt.Errorf("lambda.Start() call not found in main function")
+	if handlerRef == nil {
+		return nil, fmt.Errorf("lambda.Start() call not found in main function")
 	}
 
-	return handlerName, nil
+	return handlerRef, nil
 }
 
 // transformAST modifies the AST to replace main() with Knative handler structure
@@ -407,6 +437,22 @@ func createHandleMethod(handlerFuncName, contextAlias, httpAlias, ioAlias string
 		handlerArgs = append(handlerArgs, ast.NewIdent("body"))
 	}
 
+	// Parse the handler function name to create the appropriate AST expression
+	// It could be either "handleRequest" or "handler.HandleRequest"
+	var handlerFuncExpr ast.Expr
+	if idx := strings.Index(handlerFuncName, "."); idx != -1 {
+		// Qualified name like "handler.HandleRequest"
+		pkgName := handlerFuncName[:idx]
+		funcName := handlerFuncName[idx+1:]
+		handlerFuncExpr = &ast.SelectorExpr{
+			X:   ast.NewIdent(pkgName),
+			Sel: ast.NewIdent(funcName),
+		}
+	} else {
+		// Simple name like "handleRequest"
+		handlerFuncExpr = ast.NewIdent(handlerFuncName)
+	}
+
 	// Call the handler and capture results
 	if handlerSig.HasOutput && handlerSig.HasError {
 		// result, err := handlerFuncName(args...)
@@ -415,7 +461,7 @@ func createHandleMethod(handlerFuncName, contextAlias, httpAlias, ioAlias string
 			Tok: token.DEFINE,
 			Rhs: []ast.Expr{
 				&ast.CallExpr{
-					Fun:  ast.NewIdent(handlerFuncName),
+					Fun:  handlerFuncExpr,
 					Args: handlerArgs,
 				},
 			},
@@ -427,7 +473,7 @@ func createHandleMethod(handlerFuncName, contextAlias, httpAlias, ioAlias string
 			Tok: token.DEFINE,
 			Rhs: []ast.Expr{
 				&ast.CallExpr{
-					Fun:  ast.NewIdent(handlerFuncName),
+					Fun:  handlerFuncExpr,
 					Args: handlerArgs,
 				},
 			},
@@ -439,7 +485,7 @@ func createHandleMethod(handlerFuncName, contextAlias, httpAlias, ioAlias string
 			Tok: token.DEFINE,
 			Rhs: []ast.Expr{
 				&ast.CallExpr{
-					Fun:  ast.NewIdent(handlerFuncName),
+					Fun:  handlerFuncExpr,
 					Args: handlerArgs,
 				},
 			},
@@ -448,7 +494,7 @@ func createHandleMethod(handlerFuncName, contextAlias, httpAlias, ioAlias string
 		// handlerFuncName(args...)
 		stmts = append(stmts, &ast.ExprStmt{
 			X: &ast.CallExpr{
-				Fun:  ast.NewIdent(handlerFuncName),
+				Fun:  handlerFuncExpr,
 				Args: handlerArgs,
 			},
 		})
@@ -569,4 +615,112 @@ func createHandleMethod(handlerFuncName, contextAlias, httpAlias, ioAlias string
 			List: stmts,
 		},
 	}
+}
+
+// analyzeHandlerSignatureWithTypes uses the type checker to analyze handler signature
+// This works even if the handler is defined in another file or package
+func analyzeHandlerSignatureWithTypes(inputFile string, file *ast.File, handlerName string, fset *token.FileSet) (*HandlerSignature, error) {
+	// Get absolute path
+	absPath, err := filepath.Abs(inputFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get absolute path: %w", err)
+	}
+
+	// Use packages.Load to properly handle Go modules and imports
+	cfg := &packages.Config{
+		Mode: packages.NeedTypes | packages.NeedTypesInfo | packages.NeedImports,
+		Dir:  filepath.Dir(absPath),
+	}
+
+	pkgs, err := packages.Load(cfg, ".")
+	if err != nil {
+		return nil, fmt.Errorf("failed to load package: %w", err)
+	}
+
+	if len(pkgs) == 0 {
+		return nil, fmt.Errorf("no packages found")
+	}
+
+	pkg := pkgs[0]
+	if len(pkg.Errors) > 0 {
+		// Log errors but continue - we might still find the handler
+		for _, err := range pkg.Errors {
+			fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+		}
+	}
+
+	// Find the handler function object in the package's type info
+	var handlerObj types.Object
+	if pkg.TypesInfo != nil {
+		// First check Defs (definitions in this package)
+		for id, obj := range pkg.TypesInfo.Defs {
+			if id.Name == handlerName {
+				if _, ok := obj.(*types.Func); ok {
+					handlerObj = obj
+					break
+				}
+			}
+		}
+
+		// If not found locally, check Uses (imported symbols)
+		if handlerObj == nil {
+			for id, obj := range pkg.TypesInfo.Uses {
+				if id.Name == handlerName {
+					if _, ok := obj.(*types.Func); ok {
+						handlerObj = obj
+						break
+					}
+				}
+			}
+		}
+	}
+
+	if handlerObj == nil {
+		return nil, fmt.Errorf("handler function %s not found in package or imports", handlerName)
+	}
+
+	// Get the function signature
+	funcType, ok := handlerObj.Type().(*types.Signature)
+	if !ok {
+		return nil, fmt.Errorf("handler is not a function")
+	}
+
+	// Analyze the signature
+	sig := &HandlerSignature{}
+
+	// Check parameters
+	params := funcType.Params()
+	if params != nil && params.Len() > 0 {
+		// Check if first param is context.Context
+		firstParam := params.At(0)
+		if named, ok := firstParam.Type().(*types.Named); ok {
+			obj := named.Obj()
+			if obj.Pkg() != nil && obj.Pkg().Path() == "context" && obj.Name() == "Context" {
+				sig.HasContext = true
+				if params.Len() == 2 {
+					sig.HasInput = true
+				}
+			}
+		} else if params.Len() == 1 {
+			// Single param that's not context
+			sig.HasInput = true
+		}
+	}
+
+	// Check return values
+	results := funcType.Results()
+	if results != nil && results.Len() > 0 {
+		if results.Len() == 1 {
+			// Check if it's an error
+			if results.At(0).Type().String() == "error" {
+				sig.HasError = true
+			}
+		} else if results.Len() == 2 {
+			// (TOut, error)
+			sig.HasOutput = true
+			sig.HasError = true
+		}
+	}
+
+	return sig, nil
 }
